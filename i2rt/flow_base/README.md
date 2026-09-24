@@ -540,8 +540,7 @@ Programs that build a `Vehicle` directly rather than running `flow_base_controll
 
 Final check with the real controller:
 ```bash
-python i2rt/flow_base/flow_base_controller.py            # remote / API teleop
-python i2rt/flow_base/flow_base_controller.py --gamepad  # wired-gamepad teleop
+python i2rt/flow_base/flow_base_controller.py  # gamepad teleop when a joystick is plugged in, otherwise remote / API only
 ```
 To debug a gamepad's raw axis/button values, run the standalone reader:
 ```bash

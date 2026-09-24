@@ -1148,8 +1148,6 @@ if __name__ == "__main__":
         """CAN channel for the base motors."""
         linear_rail: bool = False
         """Enable linear rail (9th motor). Disabled by default."""
-        gamepad: bool = False
-        """Enable gamepad/joystick teleop. Disabled by default (remote commands only)."""
         control_freq: float = CONTROL_FREQ
         """Control loop frequency in Hz."""
         device: Optional[str] = None
@@ -1170,15 +1168,13 @@ if __name__ == "__main__":
     DEADZONE = 0.05  # Deadzone for base control (x, y, theta)
     RAIL_DEADZONE = 0.15  # Larger deadzone for linear rail to prevent unwanted movement
 
-    # Initialize pygame and joystick only when gamepad teleop is enabled
-    joy = None
-    if args.gamepad:
-        pygame.init()
-        pygame.joystick.init()
-        if pygame.joystick.get_count() == 0:
-            print("No joystick/gamepad connected!")
-            exit()
-        joy = pygame.joystick.Joystick(0)
+    # Gamepad teleop is active only when a joystick is plugged in; otherwise remote commands only.
+    pygame.init()
+    pygame.joystick.init()
+    gamepad_active = pygame.joystick.get_count() > 0
+    joy = pygame.joystick.Joystick(0) if gamepad_active else None
+    if not gamepad_active:
+        logger.info("No joystick/gamepad connected; running with remote commands only.")
 
     max_vel = np.array([1.0, 1.0, np.pi])
     max_accel = np.array([0.8, 0.8, 3.0])
@@ -1262,7 +1258,7 @@ if __name__ == "__main__":
     server.start(block=False)
 
     gamepad = None
-    if args.gamepad:
+    if gamepad_active:
         print(f"Joystick Name: {joy.get_name()}")
         print(f"Number of Axes: {joy.get_numaxes()}")
         print(f"Number of Buttons: {joy.get_numbuttons()}")
@@ -1295,7 +1291,7 @@ if __name__ == "__main__":
         while True:
             cmd_4d = np.zeros(4)
             gamepad_override_button = False
-            if args.gamepad:
+            if gamepad_active:
                 gamepad_cmd = gamepad.get_user_cmd()  # 3D: [x, y, theta]
                 gamepad_button = gamepad.get_button_reading()
 
@@ -1392,8 +1388,7 @@ if __name__ == "__main__":
             vehicle.close()
         except Exception as e:
             logger.error(f"Error during close: {e}")
-        if args.gamepad:
-            pygame.quit()
+        pygame.quit()
 
     # After the finally: the base is stopped and the chain is closed before the operator is told why.
     caster_fault = vehicle.caster_fault()
