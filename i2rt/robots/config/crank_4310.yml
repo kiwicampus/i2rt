@@ -1,0 +1,45 @@
+last_joint_mount:
+  yam:
+    v1:
+      pos: "0.0404996 0 -0.0356"
+      quat: "0 0.70711 0.70711 0"
+      axis: "0 0 1"
+  yam_pro:
+    v1:
+      pos: "0.0404996 0 -0.0356"
+      quat: "0 0.70711 0.70711 0"
+      axis: "0 0 1"
+  yam_ultra:
+    v1:
+      pos: "0.0404996 0 -0.0419481"
+      quat: "0 0.70711 0.70711 0"
+      axis: "0 0 1"
+    v2:
+      pos: "0.0404996 0 -0.0419481"
+      quat: "0 0.70711 0.70711 0"
+      axis: "0 0 1"
+  big_yam:
+    v1:
+      pos: "0.0356 0 -0.0404996"
+      quat: "0.5 -0.5 0.5 -0.5"
+      axis: "0 0 1"
+
+# Gripper motor config
+motor_type: "DM4310"
+motor_kp: 20.0
+motor_kd: 0.5
+
+# Gripper limits — null triggers runtime auto-calibration (see motor_chain_robot.py)
+gripper_limits: null
+needs_calibration: true
+
+# Force limiter config
+limiter:
+  clog_force_threshold: 0.5
+  clog_speed_threshold: 0.2
+  sign: 1.0
+  force_torque_map: "crank"
+  gripper_close_angle: 0.13962634    # 8/180*pi
+  gripper_open_angle: 2.96705973     # 170/180*pi
+  gripper_stroke: 0.071
+  motor_reading_offset: 0.174
