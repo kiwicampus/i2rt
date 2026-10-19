@@ -68,7 +68,7 @@ def get_big_yam_robot(
         gripper_index=6,
         gripper_limits=gripper_type.get_gripper_limits(),
         gripper_type=gripper_type,
-        limit_gripper_force=50.0,
+        limit_gripper_force=10.0,
     )
     return get_robot()
 
@@ -150,7 +150,7 @@ def get_yam_robot(
             gripper_index=6,
             gripper_limits=gripper_type.get_gripper_limits(),
             gripper_type=gripper_type,
-            limit_gripper_force=50.0,
+            limit_gripper_force=10.0,
         )
     else:
         return get_robot()

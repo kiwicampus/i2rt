@@ -8,6 +8,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 from i2rt.motor_drivers.dm_driver import DMChainCanInterface
+from i2rt.motor_drivers.utils import MotorType
 
 I2RT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 YAM_XML_PATH = os.path.join(I2RT_ROOT, "robot_models/yam/yam.xml")
@@ -88,10 +89,9 @@ class GripperType(enum.Enum):
             raise ValueError(f"Unknown gripper type: {self}")
 
     def get_motor_kp_kd(self) -> tuple[float, float]:
-        if self in [GripperType.CRANK_4310, GripperType.LINEAR_4310]:
-            return 20, 0.5
-        elif self in [GripperType.LINEAR_3507]:
-            return 10, 0.3
+        # POS_FORCE frames carry no gains: these apply in MIT before the mode switch, and kp == 0 means limp
+        if self in [GripperType.CRANK_4310, GripperType.LINEAR_4310, GripperType.LINEAR_3507]:
+            return 3.0, 0.15
         elif self == GripperType.YAM_TEACHING_HANDLE:
             return -1.0, -1.0  # no kp or kd for teaching handle
         else:
@@ -107,18 +107,27 @@ class GripperType(enum.Enum):
         else:
             raise ValueError(f"Unknown gripper type: {self}")
 
-    def get_gripper_limiter_params(self) -> tuple[float, float, float, callable]:
+    def get_gripper_max_vel(self) -> float:
+        """Gripper speed limit in normalized strokes per second."""
+        return 4.0
+
+    def force_to_current_pu(self, gripper_force: float, current_angle: float) -> float:
+        """POS_FORCE current, per unit of the motor Imax, for gripper_force (N) at the raw motor angle."""
+        force_torque_map = self.get_gripper_clog_params()[2]
+        torque = force_torque_map(gripper_force=gripper_force, current_angle=current_angle) + 0.3  # friction
+        torque_max = MotorType.get_motor_constants(self.get_motor_type()).TORQUE_MAX
+        return float(np.clip(torque / torque_max, 0.0, 1.0))
+
+    def get_gripper_clog_params(self) -> tuple[float, float, callable]:
         """
         clog_force_threshold: float,
         clog_speed_threshold: float,
-        sign: float,
         gripper_force_torque_map: callable,
         """
         if self == GripperType.CRANK_4310:
             return (
-                0.5,
+                0.3,
                 0.2,
-                1.0,
                 partial(
                     zero_linkage_crank_gripper_force_torque_map,
                     motor_reading_to_crank_angle=lambda x: (-x + 0.174),
@@ -127,22 +136,10 @@ class GripperType(enum.Enum):
                     gripper_stroke=0.071,  # unit in meter
                 ),
             )
-        elif self == GripperType.LINEAR_3507:
+        elif self in [GripperType.LINEAR_3507, GripperType.LINEAR_4310]:
             return (
-                0.5,
                 0.3,
-                1.0,
-                partial(
-                    linear_gripper_force_torque_map,
-                    motor_stroke=6.57,
-                    gripper_stroke=0.096,
-                ),
-            )
-        elif self == GripperType.LINEAR_4310:
-            return (
-                0.5,
                 0.3,
-                1.0,
                 partial(
                     linear_gripper_force_torque_map,
                     motor_stroke=6.57,
@@ -150,7 +147,7 @@ class GripperType(enum.Enum):
                 ),
             )
         elif self in [GripperType.YAM_TEACHING_HANDLE, GripperType.NO_GRIPPER]:
-            return -1.0, -1.0, -1.0, None
+            return -1.0, -1.0, None
 
 
 class JointMapper:
@@ -284,86 +281,46 @@ class LockFreeCircularBuffer:
         return self.values[valid_mask]
 
 
-class GripperForceLimiter:
+class GripperClogDetector:
+    """Flags when the gripper is stalled against an object, from its averaged effort and speed."""
+
     def __init__(
         self,
-        max_force: float,
         gripper_type: GripperType,
-        kp: float,
-        average_torque_window: float = 0.1,  # in seconds
-        debug: bool = False,
+        average_torque_window: float = 0.05,  # in seconds
+        clog_release_threshold: float = 0.15,  # in Nm
     ):
-        self.max_force = max_force
         self.gripper_type = gripper_type
-        self._is_clogged = False
-        self._gripper_adjusted_qpos = None
-        self._kp = kp
-        self._past_gripper_effort_buffer = LockFreeCircularBuffer(maxsize=1000)
         self.average_torque_window = average_torque_window
-        self.debug = debug
-        (self.clog_force_threshold, self.clog_speed_threshold, self.sign, _gripper_force_torque_map) = (
-            self.gripper_type.get_gripper_limiter_params()
-        )
-        self.gripper_force_torque_map = partial(
-            _gripper_force_torque_map,
-            gripper_force=self.max_force,
-        )
+        self.clog_release_threshold = clog_release_threshold
+        self.clog_force_threshold, self.clog_speed_threshold, _ = self.gripper_type.get_gripper_clog_params()
+        self._is_clogged = False
+        self._past_gripper_effort_buffer = LockFreeCircularBuffer(maxsize=1000)
 
-    def compute_target_gripper_torque(self, gripper_state: Dict[str, float]) -> float:
-        current_speed = gripper_state["current_qvel"]
+    @property
+    def is_clogged(self) -> bool:
+        return self._is_clogged
+
+    def update(self, gripper_state: Dict[str, float]) -> bool:
+        self._past_gripper_effort_buffer.put(time.time(), gripper_state["current_eff"])
         relevant_history_effort = self._past_gripper_effort_buffer.get_recent_values(self.average_torque_window)
         if len(relevant_history_effort) > 0:
             average_effort = np.abs(np.mean(relevant_history_effort))
         else:
             average_effort = 0.0
 
-        if self.debug:
-            print(f"average_effort: {average_effort}")
-
         if self._is_clogged:
             normalized_current_qpos = gripper_state["current_normalized_qpos"]
             normalized_target_qpos = gripper_state["target_normalized_qpos"]
             # 0 close 1 open
-            if (normalized_current_qpos < normalized_target_qpos) or average_effort < 0.2:  # want to open
+            if normalized_current_qpos < normalized_target_qpos or average_effort < self.clog_release_threshold:
                 self._is_clogged = False
-        elif average_effort > self.clog_force_threshold and np.abs(current_speed) < self.clog_speed_threshold:
+        elif (
+            average_effort > self.clog_force_threshold
+            and np.abs(gripper_state["current_qvel"]) < self.clog_speed_threshold
+        ):
             self._is_clogged = True
-
-        if self._is_clogged:
-            target_eff = self.gripper_force_torque_map(current_angle=gripper_state["current_qpos"])
-            self._is_clogged = True
-            return target_eff + 0.3  # this is to compensate the friction
-        else:
-            return None
-
-    def update(self, gripper_state: Dict[str, float]) -> None:
-        current_ts = time.time()
-        self._past_gripper_effort_buffer.put(current_ts, gripper_state["current_eff"])
-        target_eff = self.compute_target_gripper_torque(gripper_state)
-
-        if target_eff is not None:
-            command_sign = np.sign(gripper_state["target_qpos"] - gripper_state["current_qpos"]) * self.sign
-            current_zero_eff_pos = (
-                gripper_state["last_command_qpos"] - command_sign * np.abs(gripper_state["current_eff"]) / self._kp
-            )
-            target_gripper_raw_pos = current_zero_eff_pos + command_sign * np.abs(target_eff) / self._kp
-            if self.debug:
-                print("clogged")
-                print(f"gripper_state: {gripper_state}")
-                print("current zero eff")
-                print(current_zero_eff_pos)
-                print(f"target_gripper_raw_pos: {target_gripper_raw_pos}")
-            # Update gripper target position
-            a = 0.1
-            if self._gripper_adjusted_qpos is None:  # initialize it to the target position
-                self._gripper_adjusted_qpos = target_gripper_raw_pos
-            self._gripper_adjusted_qpos = (1 - a) * self._gripper_adjusted_qpos + a * target_gripper_raw_pos
-            return self._gripper_adjusted_qpos
-        else:
-            if self.debug:
-                print("unclogged")
-            self._gripper_adjusted_qpos = gripper_state["current_qpos"]
-            return gripper_state["target_qpos"]
+        return self._is_clogged
 
 
 def detect_gripper_limits(
@@ -373,7 +330,6 @@ def detect_gripper_limits(
     max_duration: float = 2.0,
     position_threshold: float = 0.01,
     check_interval: float = 0.1,
-    close_offset: float = 0.05,
 ) -> List[float]:
     """
     Detect gripper limits by applying test torques and monitoring position changes.
@@ -385,7 +341,6 @@ def detect_gripper_limits(
         max_duration: Maximum test duration for each direction (s)
         position_threshold: Minimum position change to consider motor still moving (rad)
         check_interval: Time interval between checks (s)
-        close_offset: Add offset to limit of closing gripper to ensure sufficient torque for grasping (percentage: 0.0-1.0)
 
     Returns:
         List of detected limits [limit1, limit2]
@@ -454,9 +409,6 @@ def detect_gripper_limits(
     else:
         # Negative direction: [min, max]
         detected_limits = [min_pos, max_pos]
-
-    # joint limit offset, to ensure sufficient torques when gripper closes
-    detected_limits[0] += close_offset * (max_pos - min_pos) * motor_direction
 
     logger.info(f"Motor direction: {motor_direction}, detected limits: {detected_limits}")
 
