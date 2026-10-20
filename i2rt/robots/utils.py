@@ -330,6 +330,7 @@ def detect_gripper_limits(
     max_duration: float = 2.0,
     position_threshold: float = 0.01,
     check_interval: float = 0.1,
+    open_inset: float = 0.01,
 ) -> List[float]:
     """
     Detect gripper limits by applying test torques and monitoring position changes.
@@ -341,6 +342,7 @@ def detect_gripper_limits(
         max_duration: Maximum test duration for each direction (s)
         position_threshold: Minimum position change to consider motor still moving (rad)
         check_interval: Time interval between checks (s)
+        open_inset: Fraction of the stroke the open limit sits inside the stop, so position control rests unloaded
 
     Returns:
         List of detected limits [limit1, limit2]
@@ -409,6 +411,7 @@ def detect_gripper_limits(
     else:
         # Negative direction: [min, max]
         detected_limits = [min_pos, max_pos]
+    detected_limits[1] += open_inset * (detected_limits[0] - detected_limits[1])
 
     logger.info(f"Motor direction: {motor_direction}, detected limits: {detected_limits}")
 

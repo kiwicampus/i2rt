@@ -236,18 +236,36 @@ def test_crank_current_depends_on_angle() -> None:
     assert near_closed < mid_stroke
 
 
-def test_detect_gripper_limits_has_no_close_offset() -> None:
-    positions = iter([0.0, -0.5, -1.0] + [-1.0] * 10 + [0.0, 0.05, 0.05] + [0.05] * 10)
+def run_detect_gripper_limits(first_sweep: list, second_sweep: list, direction: int, **kwargs: float) -> list:
+    positions = iter([0.0] + first_sweep + [first_sweep[-1]] * 10 + second_sweep + [second_sweep[-1]] * 10)
 
     def read_states() -> list:
         pos = next(positions)
         return [SimpleNamespace(pos=0.0, eff=0.0), SimpleNamespace(pos=pos, eff=0.0)]
 
     chain = SimpleNamespace(
-        motor_list=[0, 1], motor_direction=np.array([1, 1]), read_states=read_states, set_commands=mock.Mock()
+        motor_list=[0, 1],
+        motor_direction=np.array([1, direction]),
+        read_states=read_states,
+        set_commands=mock.Mock(),
     )
     with mock.patch.object(utils.time, "sleep"):
-        limits = detect_gripper_limits(chain, gripper_index=1, check_interval=0.0, max_duration=1e9)
+        return detect_gripper_limits(chain, gripper_index=1, check_interval=0.0, max_duration=1e9, **kwargs)
+
+
+def test_detect_gripper_limits_insets_only_open() -> None:
+    # closed stays on the stop; open moves 1% of the 1.05 stroke toward closed
+    limits = run_detect_gripper_limits([-0.5, -1.0], [0.0, 0.05], direction=1)
+    assert limits == pytest.approx([0.05, -1.0 + 0.0105])
+
+
+def test_detect_gripper_limits_inset_follows_negative_direction() -> None:
+    limits = run_detect_gripper_limits([0.5, 2.0], [0.0, -1.0], direction=-1)
+    assert limits == pytest.approx([-1.0, 2.0 - 0.03])
+
+
+def test_detect_gripper_limits_zero_inset_keeps_stops() -> None:
+    limits = run_detect_gripper_limits([-0.5, -1.0], [0.0, 0.05], direction=1, open_inset=0.0)
     assert limits == [0.05, -1.0]
 
 
