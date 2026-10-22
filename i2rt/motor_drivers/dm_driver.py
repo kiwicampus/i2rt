@@ -35,21 +35,34 @@ EXPECTED_CONTROL_PERIOD = 0.007
 REPORT_INTERVAL = 30.0
 
 
+# DM parameter register access, sent on PARAM_FRAME_ID
+PARAM_FRAME_ID = 0x7FF
+PARAM_READ = 0x33
+PARAM_WRITE = 0x55
+RID_CTRL_MODE = 10
+RID_KP_APR = 27  # position loop gain used by POS_VEL and POS_FORCE
+
+
 class ControlMode:
     MIT = "MIT"
     POS_VEL = "POS_VEL"
     VEL = "VEL"
+    POS_FORCE = "POS_FORCE"
+
+    _ID_OFFSET = {MIT: 0x000, POS_VEL: 0x100, VEL: 0x200, POS_FORCE: 0x300}
+    _REGISTER_VALUE = {MIT: 1, POS_VEL: 2, VEL: 3, POS_FORCE: 4}
 
     @classmethod
     def get_id_offset(cls, control_mode: str) -> int:
-        if control_mode == cls.MIT:
-            return 0x000
-        elif control_mode == cls.POS_VEL:
-            return 0x100
-        elif control_mode == cls.VEL:
-            return 0x200
-        else:
+        if control_mode not in cls._ID_OFFSET:
             raise ValueError(f"Control mode '{control_mode}' not recognized.")
+        return cls._ID_OFFSET[control_mode]
+
+    @classmethod
+    def get_register_value(cls, control_mode: str) -> int:
+        if control_mode not in cls._REGISTER_VALUE:
+            raise ValueError(f"Control mode '{control_mode}' not recognized.")
+        return cls._REGISTER_VALUE[control_mode]
 
 
 ######### for passive encoder #########
@@ -141,9 +154,50 @@ class DMSingleMotorCanInterface(CanInterface):
         self.cmd_idoffset = ControlMode.get_id_offset(self.control_mode)
         self.receive_mode = receive_mode
 
-    def _get_frame_id(self, motor_id: int) -> int:
+    def _get_frame_id(self, motor_id: int, control_mode: Optional[str] = None) -> int:
         """Calculate the Control Frame ID for a given motor."""
-        return self.cmd_idoffset + motor_id
+        if control_mode is None:
+            return self.cmd_idoffset + motor_id
+        return ControlMode.get_id_offset(control_mode) + motor_id
+
+    def _param_frame(self, motor_id: int, op: int, rid: int, payload: bytes = bytes(4)) -> List[int]:
+        return [motor_id & 0xFF, (motor_id >> 8) & 0xFF, op, rid] + list(payload)
+
+    def _read_param(self, motor_id: int, rid: int) -> bytes:
+        """Read a register's raw value; the reply echoes [id_l, id_h, 0x33, rid, value(4, LE)]."""
+        data = self._param_frame(motor_id, PARAM_READ, rid)
+        message = self._send_message_get_response(PARAM_FRAME_ID, motor_id, data)
+        if message.data[2] != PARAM_READ or message.data[3] != rid:
+            raise RuntimeError(f"motor {motor_id}: unexpected reply {bytes(message.data).hex()} reading RID {rid}")
+        return bytes(message.data[4:8])
+
+    def _write_param(self, motor_id: int, rid: int, payload: bytes) -> None:
+        """Write a register to RAM only; it reverts to the flash value on power cycle."""
+        data = self._param_frame(motor_id, PARAM_WRITE, rid, payload)
+        self._send_message_get_response(PARAM_FRAME_ID, motor_id, data)
+
+    def read_param_uint(self, motor_id: int, rid: int) -> int:
+        return struct.unpack("<I", self._read_param(motor_id, rid))[0]
+
+    def write_param_uint(self, motor_id: int, rid: int, value: int) -> None:
+        self._write_param(motor_id, rid, struct.pack("<I", value))
+
+    def read_param_float(self, motor_id: int, rid: int) -> float:
+        return struct.unpack("<f", self._read_param(motor_id, rid))[0]
+
+    def write_param_float(self, motor_id: int, rid: int, value: float) -> None:
+        self._write_param(motor_id, rid, struct.pack("<f", value))
+
+    def set_control_mode(self, motor_id: int, control_mode: str) -> None:
+        """Write the motor control mode register and read it back to confirm the firmware accepted it."""
+        expected = ControlMode.get_register_value(control_mode)
+        self.write_param_uint(motor_id, RID_CTRL_MODE, expected)
+        actual = self.read_param_uint(motor_id, RID_CTRL_MODE)
+        if actual != expected:
+            raise RuntimeError(
+                f"motor {motor_id} on {self.name} rejected control mode {control_mode}: register reads {actual}"
+            )
+        logging.info(f"motor {motor_id} on {self.name} control mode set to {control_mode}")
 
     def motor_on(self, motor_id: int, motor_type: str) -> None:
         """Turn on the motor.
@@ -231,6 +285,9 @@ class DMSingleMotorCanInterface(CanInterface):
         kp: float,
         kd: float,
         torque: float,
+        control_mode: Optional[str] = None,
+        vel_limit: float = 0.0,
+        current_limit: float = 0.0,
     ) -> FeedbackFrameInfo:
         """Set the control of the motor and return its status.
 
@@ -242,14 +299,18 @@ class DMSingleMotorCanInterface(CanInterface):
             kp (float): The proportional gain value.
             kd (float): The derivative gain value.
             torque (float): The target torque value.
+            control_mode (str): Overrides the interface control mode for this motor.
+            vel_limit (float): POS_FORCE speed limit in rad/s.
+            current_limit (float): POS_FORCE current limit, per unit of the motor Imax [0, 1].
 
         Returns:
             FeedbackFrameInfo: The current state of the motor, including motor id, error code, position, velocity, torque, temperature.
         """
-        frame_id = self._get_frame_id(motor_id)
+        control_mode = self.control_mode if control_mode is None else control_mode
+        frame_id = self._get_frame_id(motor_id, control_mode)
         # Prepare the CAN message
         data = bytearray(8)
-        if self.control_mode == ControlMode.MIT:
+        if control_mode == ControlMode.MIT:
             const = MotorType.get_motor_constants(motor_type)
 
             pos_tmp = float_to_uint(pos, const.POSITION_MIN, const.POSITION_MAX, 16)
@@ -268,10 +329,15 @@ class DMSingleMotorCanInterface(CanInterface):
             data[5] = (kd_tmp >> 4) & 0xFF
             data[6] = ((kd_tmp & 0xF) << 4) | (tor_tmp >> 8)
             data[7] = tor_tmp & 0xFF
-        elif self.control_mode == ControlMode.VEL:
+        elif control_mode == ControlMode.VEL:
             # system will only response to vel command
             can_data = struct.pack("<f", vel)
             data[0:4] = can_data[0:4]
+        elif control_mode == ControlMode.POS_FORCE:
+            # p_des float rad, v_des uint16 rad/s x100, i_des uint16 per unit x10000, all little endian
+            v_des = int(np.clip(vel_limit * 100.0, 0, 10000))
+            i_des = int(np.clip(current_limit * 10000.0, 0, 10000))
+            data[0:8] = struct.pack("<fHH", pos, v_des, i_des)
 
         # Send the CAN message
         message = self._send_message_get_response(frame_id, motor_id, data, max_retry=15)
@@ -345,6 +411,12 @@ class MotorCmd:
     kd: float = 0.0
 
 
+@dataclass
+class PosForceLimits:
+    vel: float  # rad/s
+    current: float  # per unit of the motor Imax
+
+
 class MotorChain(Protocol):
     """Class for CAN interface with multiple motors."""
 
@@ -376,6 +448,7 @@ class DMChainCanInterface(MotorChain):
         motor_chain_name: str = "default_motor_chain",
         receive_mode: ReceiveMode = ReceiveMode.p16,
         control_mode: ControlMode = ControlMode.MIT,
+        motor_control_modes: Optional[List[str]] = None,  # per motor override, written to each motor on startup
         get_same_bus_device_driver: Optional[Callable] = None,
         use_buffered_reader: bool = False,  # buffered reader is not very stable, the latest encoder fix allows us to use the non-buffered reader
     ):
@@ -419,10 +492,16 @@ class DMChainCanInterface(MotorChain):
             self.same_bus_device_driver = None
 
         self.absolute_positions = None
+        self.control_modes = list(motor_control_modes) if motor_control_modes else [control_mode] * len(motor_list)
+        assert len(self.control_modes) == len(motor_list)
+        self.pos_force_limits = [PosForceLimits(vel=0.0, current=0.0) for _ in motor_list]
+        self._write_control_modes()
         self._motor_on()
         starting_command = []
-        for motor_state in self.state:
-            starting_command.append(MotorCmd(torque=motor_state.torque))
+        for idx, motor_state in enumerate(self.state):
+            # start at the measured position so a POS_FORCE motor does not jump once it gets current
+            pos = self._joint_position_real_to_sim_idx(self.absolute_positions[idx], idx)
+            starting_command.append(MotorCmd(torque=motor_state.torque, pos=pos))
         logging.info(f"Initializing motorchain with starting command: {starting_command}")
         self.commands = starting_command
         self.command_lock = threading.Lock()
@@ -476,6 +555,43 @@ class DMChainCanInterface(MotorChain):
 
     def _joint_position_sim_to_real_idx(self, joint_position_sim: float, idx: int) -> float:
         return joint_position_sim * self.motor_direction[idx] + self.motor_offset[idx]
+
+    def _write_control_modes(self) -> None:
+        """Assert every motor's control mode, since a register written in a previous run survives until power off."""
+        for _ in range(7):
+            self.motor_interface.try_receive_message(timeout=0.001)
+        for (motor_id, _), control_mode in zip(self.motor_list, self.control_modes):
+            self.motor_interface.set_control_mode(motor_id, control_mode)
+
+    def set_pos_force_limits(self, idx: int, vel: float, current: float) -> None:
+        """Speed (rad/s) and current (per unit) limits used while the motor is in POS_FORCE."""
+        with self.command_lock:
+            self.pos_force_limits[idx] = PosForceLimits(vel=vel, current=float(np.clip(current, 0.0, 1.0)))
+
+    def set_register_float(self, idx: int, rid: int, value: float) -> None:
+        """Write one motor's float register to RAM and read it back; the control loop is paused meanwhile."""
+        with self.command_lock:
+            motor_id = self.motor_list[idx][0]
+            self.motor_interface.write_param_float(motor_id, rid, value)
+            actual = self.motor_interface.read_param_float(motor_id, rid)
+        if not np.isclose(actual, value, rtol=1e-6):
+            raise RuntimeError(
+                f"motor {motor_id} on {self.motor_interface.name} rejected RID {rid} = {value}: reads {actual}"
+            )
+
+    def set_control_mode(self, idx: int, control_mode: str) -> None:
+        """Switch one motor at runtime; the control loop is paused while the register is written."""
+        with self.command_lock:
+            motor_id, _ = self.motor_list[idx]
+            self.motor_interface.motor_off(motor_id)
+            self.motor_interface.set_control_mode(motor_id, control_mode)
+            self.control_modes[idx] = control_mode
+            with self.state_lock:
+                held_pos = self._joint_position_real_to_sim_idx(self.absolute_positions[idx], idx)
+            self.commands[idx] = MotorCmd(pos=held_pos, kp=self.commands[idx].kp, kd=self.commands[idx].kd)
+            for _ in range(7):
+                self.motor_interface.try_receive_message(timeout=0.001)
+            self.motor_interface.motor_on(motor_id, self.motor_list[idx][1])
 
     def _motor_on(self) -> None:
         motor_feedback = []
@@ -576,6 +692,9 @@ class DMChainCanInterface(MotorChain):
             vel = commands[idx].vel * self.motor_direction[idx]
             kp = commands[idx].kp
             kd = commands[idx].kd
+            limits = self.pos_force_limits[idx]
+            # kp == 0 means limp in MIT; mirror it in POS_FORCE with a zero current limit
+            current_limit = limits.current if kp > 0 else 0.0
             try:
                 fd_back = self.motor_interface.set_control(
                     motor_id=motor_id,
@@ -585,6 +704,9 @@ class DMChainCanInterface(MotorChain):
                     kp=kp,
                     kd=kd,
                     torque=torque,
+                    control_mode=self.control_modes[idx],
+                    vel_limit=limits.vel,
+                    current_limit=current_limit,
                 )
             except Exception as e:
                 logging.error(f"{idx}th motor at DMChainCanInterface {self} failed with info {motor_info}")

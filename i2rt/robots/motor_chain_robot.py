@@ -9,12 +9,14 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 
 from i2rt.motor_drivers.dm_driver import (
+    RID_KP_APR,
+    ControlMode,
     MotorChain,
     MotorInfo,
     PassiveEncoderInfo,
 )
 from i2rt.robots.robot import Robot
-from i2rt.robots.utils import GripperForceLimiter, GripperType, JointMapper, detect_gripper_limits
+from i2rt.robots.utils import GripperClogDetector, GripperType, JointMapper, detect_gripper_limits
 from i2rt.utils.mujoco_utils import MuJoCoKDL
 
 
@@ -74,7 +76,10 @@ class MotorChainRobot(Robot):
         kd: Union[float, List[float]] = 1.0,
         joint_limits: Optional[np.ndarray] = None,  # if provided, override the mujoco xml joint limits
         gripper_limits: Optional[np.ndarray] = None,  # [closed, open]
-        limit_gripper_force: float = -1,  # whether to limit the gripper effort when it is blocked. -1 means no limit.
+        gripper_hold_torque: float = -1,  # gripper motor torque (Nm) when blocked, friction included; <= 0 means no limit
+        gripper_max_move_torque: Optional[float] = None,  # torque cap (Nm) while moving; None uses the gripper type's
+        gripper_max_vel: Optional[float] = None,  # gripper speed cap (strokes/s); None uses the gripper type's
+        gripper_kp_pos: Optional[float] = None,  # firmware position loop gain (KP_APR); None keeps the motor's value
         clip_motor_torque: float = np.inf,  # clip the offset motor torque, real motor torque can still still be larger than this setting depending on the motor onboard PID loop
         gripper_type: GripperType = GripperType.CRANK_4310,
         temp_record_flag: bool = False,  # whether record the motor's temperature
@@ -131,7 +136,6 @@ class MotorChainRobot(Robot):
             self._joint_state_saver = self._joint_state_saver_factory()
         else:
             self._joint_state_saver = None
-        self._last_gripper_command_qpos = None
         assert clip_motor_torque >= 0.0
         self._clip_motor_torque = clip_motor_torque
         self.motor_chain = motor_chain
@@ -142,18 +146,23 @@ class MotorChainRobot(Robot):
         self._gripper_index = gripper_index
         self.remapper = JointMapper({}, len(motor_chain))  # so it works without gripper
         self._gripper_limits = gripper_limits
-        self._limit_gripper_force = limit_gripper_force
+        self._gripper_hold_torque = gripper_hold_torque
 
         if self._gripper_index is not None:
-            self._gripper_force_limiter = GripperForceLimiter(
-                max_force=limit_gripper_force, gripper_type=gripper_type, kp=kp[gripper_index]
-            )  # force in newton
-            self._limit_gripper_force = limit_gripper_force
+            self._gripper_type = gripper_type
+            self._gripper_move_torque = (
+                gripper_type.get_gripper_move_torque() if gripper_max_move_torque is None else gripper_max_move_torque
+            )
+            self._gripper_max_vel = gripper_type.get_gripper_max_vel() if gripper_max_vel is None else gripper_max_vel
+            self._gripper_kp_pos = gripper_kp_pos
+            self._gripper_clog_detector = GripperClogDetector(gripper_type=gripper_type)
+            self._gripper_pos_force_limits: Optional[Tuple[float, float]] = None
 
             self.remapper = JointMapper(
                 index_range_map={gripper_index: gripper_limits},
                 total_dofs=len(motor_chain),
             )
+            self._enable_gripper_pos_force()
 
         # make sure kp, kd are float number not int
         self._kp = (
@@ -271,7 +280,7 @@ class MotorChainRobot(Robot):
             "joint_limits": self._joint_limits,
             "gripper_limits": self._gripper_limits,
             "gravity_comp_factor": self.gravity_comp_factor,
-            "limit_gripper_effort": self._limit_gripper_force,
+            "gripper_hold_torque": self._gripper_hold_torque,
             "gripper_index": self._gripper_index,
         }
 
@@ -305,6 +314,30 @@ class MotorChainRobot(Robot):
                 last_time = current_time
                 iteration_count = 0
 
+    def _enable_gripper_pos_force(self) -> None:
+        """Hand gripper speed and current limiting to the motor firmware; raises if the motor rejects the mode."""
+        if self._gripper_kp_pos is not None:
+            self.motor_chain.set_register_float(self._gripper_index, RID_KP_APR, self._gripper_kp_pos)
+            self.logger.info(f"gripper position loop gain set to {self._gripper_kp_pos:g}")
+        self._update_gripper_pos_force_limits(clogged=False)
+        self.motor_chain.set_control_mode(self._gripper_index, ControlMode.POS_FORCE)
+        vel, current = self._gripper_pos_force_limits
+        self.logger.info(f"gripper in POS_FORCE, vel limit {vel:.2f} rad/s, current limit {current:.4f} pu")
+
+    def _update_gripper_pos_force_limits(self, clogged: bool) -> None:
+        """Hold torque while clogged, move torque otherwise; sent only when it changes by one i_des step."""
+        vel = self._gripper_max_vel * abs(self._gripper_limits[1] - self._gripper_limits[0])
+        if self._gripper_hold_torque > 0:
+            torque = self._gripper_hold_torque if clogged else self._gripper_move_torque
+            current = self._gripper_type.torque_to_current_pu(torque)
+        else:
+            current = 1.0
+        last = self._gripper_pos_force_limits
+        if last is not None and last[0] == vel and abs(last[1] - current) < 1e-4:
+            return
+        self.motor_chain.set_pos_force_limits(self._gripper_index, vel=vel, current=current)
+        self._gripper_pos_force_limits = (vel, current)
+
     def update(self) -> None:
         """Update the robot.
 
@@ -318,23 +351,18 @@ class MotorChainRobot(Robot):
             motor_torques = np.clip(motor_torques, -self._clip_motor_torque, self._clip_motor_torque)
 
             if self._gripper_index is not None:
-                if self._limit_gripper_force > 0 and self._joint_state is not None:
-                    # Get current gripper state in raw robot joint pos space
+                if self._gripper_hold_torque > 0 and self._joint_state is not None:
+                    # the motor caps current in POS_FORCE; clog detection only switches the cap
                     gripper_state = {
-                        "target_qpos": joint_commands.pos[self._gripper_index],
-                        "current_qpos": self.remapper.to_robot_joint_pos_space(self._joint_state.pos)[
-                            self._gripper_index
-                        ],
                         "current_qvel": self._joint_state.vel[self._gripper_index],
                         "current_eff": self._joint_state.eff[self._gripper_index],
                         "current_normalized_qpos": self._joint_state.pos[self._gripper_index],
                         "target_normalized_qpos": self.remapper.to_command_joint_pos_space(joint_commands.pos)[
                             self._gripper_index
                         ],
-                        "last_command_qpos": self._last_gripper_command_qpos,
                     }
-
-                    joint_commands.pos[self._gripper_index] = self._gripper_force_limiter.update(gripper_state)
+                    clogged = self._gripper_clog_detector.update(gripper_state)
+                    self._update_gripper_pos_force_limits(clogged)
 
                 # add final clip so the gripper won't be over-adjusted
                 joint_commands.pos[self._gripper_index] = np.clip(
@@ -342,7 +370,6 @@ class MotorChainRobot(Robot):
                     min(self._gripper_limits),
                     max(self._gripper_limits),
                 )
-                self._last_gripper_command_qpos = joint_commands.pos[self._gripper_index]
             if not self.motor_chain.start_thread_flag:
                 self.motor_chain.set_commands(
                     motor_torques,
