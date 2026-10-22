@@ -96,6 +96,17 @@ def test_set_control_mode_raises_on_feedback_reply() -> None:
         iface.set_control_mode(MOTOR_ID, ControlMode.POS_FORCE)
 
 
+def test_float_register_write_packs_little_endian() -> None:
+    iface = make_interface()
+    iface._send_message_get_response = mock.Mock()
+    iface.write_param_float(MOTOR_ID, 27, 73.0)
+    assert iface._send_message_get_response.call_args.args == (
+        0x7FF,
+        MOTOR_ID,
+        [MOTOR_ID, 0, 0x55, 27] + list(struct.pack("<f", 73.0)),
+    )
+
+
 def make_chain() -> DMChainCanInterface:
     chain = DMChainCanInterface.__new__(DMChainCanInterface)
     chain.motor_list = [(MOTOR_ID, "DM4310")]
@@ -133,6 +144,16 @@ def test_chain_runtime_switch_holds_position() -> None:
     assert calls == ["motor_off", "set_control_mode", "motor_on"]
     assert chain.control_modes == [ControlMode.POS_FORCE]
     assert chain.commands[0] == MotorCmd(pos=2.0, kp=3.0, kd=0.15)
+
+
+def test_chain_register_float_verifies_read_back() -> None:
+    chain = make_chain()
+    chain.motor_interface.read_param_float.return_value = 73.0
+    chain.set_register_float(0, 27, 73.0)
+    chain.motor_interface.write_param_float.assert_called_once_with(MOTOR_ID, 27, 73.0)
+    chain.motor_interface.read_param_float.return_value = 54.0
+    with pytest.raises(RuntimeError, match="rejected RID 27"):
+        chain.set_register_float(0, 27, 73.0)
 
 
 def test_chain_limits_are_clipped() -> None:
@@ -178,7 +199,9 @@ def feed(detector: GripperClogDetector, clock: FakeClock, eff: float, duration: 
 def test_gripper_type_values() -> None:
     for gripper_type in [GripperType.CRANK_4310, GripperType.LINEAR_4310, GripperType.LINEAR_3507]:
         assert gripper_type.get_motor_kp_kd() == (3.0, 0.15)
-        assert gripper_type.get_gripper_max_vel() == 4.0
+        assert gripper_type.get_gripper_max_vel() == 4.5
+        assert gripper_type.get_gripper_move_torque() == 1.5
+        assert gripper_type.get_gripper_hold_torque() == 0.5
         detector = GripperClogDetector(gripper_type)
         assert detector.clog_force_threshold == 0.3
         assert detector.clog_release_threshold == 0.15
@@ -222,18 +245,11 @@ def test_releases_on_open_command(clock: FakeClock) -> None:
     assert not feed(detector, clock, eff=0.35, duration=0.003, target=1.0)
 
 
-def test_force_to_current_uses_torque_max() -> None:
-    # 20 N * 0.096 m / 6.57 rad plus 0.3 Nm friction, over the DM4310 10 Nm and DM3507 5 Nm
-    torque = 20.0 * 0.096 / 6.57 + 0.3
-    assert GripperType.LINEAR_4310.force_to_current_pu(20.0, current_angle=1.0) == pytest.approx(torque / 10.0)
-    assert GripperType.LINEAR_3507.force_to_current_pu(20.0, current_angle=1.0) == pytest.approx(torque / 5.0)
-
-
-def test_crank_current_depends_on_angle() -> None:
-    crank = GripperType.CRANK_4310
-    near_closed = crank.force_to_current_pu(20.0, current_angle=0.0)
-    mid_stroke = crank.force_to_current_pu(20.0, current_angle=-1.4)
-    assert near_closed < mid_stroke
+def test_torque_to_current_uses_torque_max() -> None:
+    # DM4310 peaks at 10 Nm, DM3507 at 5 Nm
+    assert GripperType.LINEAR_4310.torque_to_current_pu(0.5) == pytest.approx(0.05)
+    assert GripperType.LINEAR_3507.torque_to_current_pu(0.5) == pytest.approx(0.1)
+    assert GripperType.LINEAR_4310.torque_to_current_pu(20.0) == 1.0
 
 
 def run_detect_gripper_limits(first_sweep: list, second_sweep: list, direction: int, **kwargs: float) -> list:
@@ -287,6 +303,7 @@ class FakeChain:
         self.last_pos: np.ndarray = np.zeros(2)
         self.set_pos_force_limits = mock.Mock()
         self.set_control_mode = mock.Mock(side_effect=RuntimeError("rejected") if reject else None)
+        self.set_register_float = mock.Mock()
 
     def __len__(self) -> int:
         return 2
@@ -314,7 +331,7 @@ def no_server_thread() -> Iterator[None]:
 
 
 def make_robot(
-    chain: FakeChain, limit: float = 10.0, gripper_type: GripperType = GripperType.LINEAR_4310
+    chain: FakeChain, hold: float = 0.5, gripper_type: GripperType = GripperType.LINEAR_4310, **gripper: float
 ) -> MotorChainRobot:
     return MotorChainRobot(
         motor_chain=chain,
@@ -324,8 +341,9 @@ def make_robot(
         kd=[1.0, 0.15],
         joint_limits=np.array([[-1.0, 1.0]]),
         gripper_limits=LIMITS,
-        limit_gripper_force=limit,
+        gripper_hold_torque=hold,
         gripper_type=gripper_type,
+        **gripper,
     )
 
 
@@ -340,8 +358,18 @@ def test_robot_switches_gripper_to_pos_force(no_server_thread: None) -> None:
     make_robot(chain)
     chain.set_control_mode.assert_called_once_with(1, ControlMode.POS_FORCE)
     kwargs = chain.set_pos_force_limits.call_args.kwargs
-    assert kwargs["vel"] == pytest.approx(4.0 * 6.0)
-    assert kwargs["current"] == pytest.approx(GripperType.LINEAR_4310.force_to_current_pu(20.0, 3.0))
+    assert kwargs["vel"] == pytest.approx(4.5 * 6.0)
+    assert kwargs["current"] == pytest.approx(0.15)
+    chain.set_register_float.assert_not_called()
+
+
+def test_robot_gripper_overrides(no_server_thread: None) -> None:
+    chain = FakeChain()
+    make_robot(chain, gripper_max_vel=5.0, gripper_max_move_torque=2.0, gripper_kp_pos=73.0)
+    chain.set_register_float.assert_called_once_with(1, 27, 73.0)
+    kwargs = chain.set_pos_force_limits.call_args.kwargs
+    assert kwargs["vel"] == pytest.approx(5.0 * 6.0)
+    assert kwargs["current"] == pytest.approx(0.2)
 
 
 def test_robot_raises_when_mode_rejected(no_server_thread: None) -> None:
@@ -352,8 +380,7 @@ def test_robot_raises_when_mode_rejected(no_server_thread: None) -> None:
 def test_robot_clog_switches_current(no_server_thread: None, clock: FakeClock) -> None:
     chain = FakeChain()
     robot = make_robot(chain)
-    moving = GripperType.LINEAR_4310.force_to_current_pu(20.0, 3.0)
-    holding = GripperType.LINEAR_4310.force_to_current_pu(10.0, 3.0)
+    moving, holding = 0.15, 0.05
 
     robot.command_joint_pos(np.array([0.0, 0.0]))
     run(robot, clock, 0.03)
@@ -381,7 +408,7 @@ def test_robot_sends_limits_only_on_change(no_server_thread: None, clock: FakeCl
 
 def test_robot_without_force_limit_uses_full_current(no_server_thread: None, clock: FakeClock) -> None:
     chain = FakeChain()
-    robot = make_robot(chain, limit=-1)
+    robot = make_robot(chain, hold=-1)
     chain.gripper_eff = 0.6
     run(robot, clock, 0.06)
     chain.set_pos_force_limits.assert_called_once()

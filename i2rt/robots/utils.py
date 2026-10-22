@@ -109,12 +109,18 @@ class GripperType(enum.Enum):
 
     def get_gripper_max_vel(self) -> float:
         """Gripper speed limit in normalized strokes per second."""
-        return 4.0
+        return 4.5
 
-    def force_to_current_pu(self, gripper_force: float, current_angle: float) -> float:
-        """POS_FORCE current, per unit of the motor Imax, for gripper_force (N) at the raw motor angle."""
-        force_torque_map = self.get_gripper_clog_params()[2]
-        torque = force_torque_map(gripper_force=gripper_force, current_angle=current_angle) + 0.3  # friction
+    def get_gripper_move_torque(self) -> float:
+        """Motor torque cap (Nm) while the gripper moves unblocked."""
+        return 1.5
+
+    def get_gripper_hold_torque(self) -> float:
+        """Motor torque (Nm) while the gripper is blocked, friction included, as read back in the motor effort."""
+        return 0.5
+
+    def torque_to_current_pu(self, torque: float) -> float:
+        """POS_FORCE current, per unit of the motor Imax, for a motor torque (Nm)."""
         torque_max = MotorType.get_motor_constants(self.get_motor_type()).TORQUE_MAX
         return float(np.clip(torque / torque_max, 0.0, 1.0))
 

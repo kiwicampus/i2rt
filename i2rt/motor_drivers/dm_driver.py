@@ -40,6 +40,7 @@ PARAM_FRAME_ID = 0x7FF
 PARAM_READ = 0x33
 PARAM_WRITE = 0x55
 RID_CTRL_MODE = 10
+RID_KP_APR = 27  # position loop gain used by POS_VEL and POS_FORCE
 
 
 class ControlMode:
@@ -159,21 +160,33 @@ class DMSingleMotorCanInterface(CanInterface):
             return self.cmd_idoffset + motor_id
         return ControlMode.get_id_offset(control_mode) + motor_id
 
-    def _param_frame(self, motor_id: int, op: int, rid: int, value: int = 0) -> List[int]:
-        return [motor_id & 0xFF, (motor_id >> 8) & 0xFF, op, rid] + list(struct.pack("<I", value))
+    def _param_frame(self, motor_id: int, op: int, rid: int, payload: bytes = bytes(4)) -> List[int]:
+        return [motor_id & 0xFF, (motor_id >> 8) & 0xFF, op, rid] + list(payload)
 
-    def read_param_uint(self, motor_id: int, rid: int) -> int:
-        """Read an integer register; the reply echoes [id_l, id_h, 0x33, rid, value(4, LE)]."""
+    def _read_param(self, motor_id: int, rid: int) -> bytes:
+        """Read a register's raw value; the reply echoes [id_l, id_h, 0x33, rid, value(4, LE)]."""
         data = self._param_frame(motor_id, PARAM_READ, rid)
         message = self._send_message_get_response(PARAM_FRAME_ID, motor_id, data)
         if message.data[2] != PARAM_READ or message.data[3] != rid:
             raise RuntimeError(f"motor {motor_id}: unexpected reply {bytes(message.data).hex()} reading RID {rid}")
-        return struct.unpack("<I", bytes(message.data[4:8]))[0]
+        return bytes(message.data[4:8])
+
+    def _write_param(self, motor_id: int, rid: int, payload: bytes) -> None:
+        """Write a register to RAM only; it reverts to the flash value on power cycle."""
+        data = self._param_frame(motor_id, PARAM_WRITE, rid, payload)
+        self._send_message_get_response(PARAM_FRAME_ID, motor_id, data)
+
+    def read_param_uint(self, motor_id: int, rid: int) -> int:
+        return struct.unpack("<I", self._read_param(motor_id, rid))[0]
 
     def write_param_uint(self, motor_id: int, rid: int, value: int) -> None:
-        """Write an integer register to RAM only; it reverts to the flash value on power cycle."""
-        data = self._param_frame(motor_id, PARAM_WRITE, rid, value)
-        self._send_message_get_response(PARAM_FRAME_ID, motor_id, data)
+        self._write_param(motor_id, rid, struct.pack("<I", value))
+
+    def read_param_float(self, motor_id: int, rid: int) -> float:
+        return struct.unpack("<f", self._read_param(motor_id, rid))[0]
+
+    def write_param_float(self, motor_id: int, rid: int, value: float) -> None:
+        self._write_param(motor_id, rid, struct.pack("<f", value))
 
     def set_control_mode(self, motor_id: int, control_mode: str) -> None:
         """Write the motor control mode register and read it back to confirm the firmware accepted it."""
@@ -554,6 +567,17 @@ class DMChainCanInterface(MotorChain):
         """Speed (rad/s) and current (per unit) limits used while the motor is in POS_FORCE."""
         with self.command_lock:
             self.pos_force_limits[idx] = PosForceLimits(vel=vel, current=float(np.clip(current, 0.0, 1.0)))
+
+    def set_register_float(self, idx: int, rid: int, value: float) -> None:
+        """Write one motor's float register to RAM and read it back; the control loop is paused meanwhile."""
+        with self.command_lock:
+            motor_id = self.motor_list[idx][0]
+            self.motor_interface.write_param_float(motor_id, rid, value)
+            actual = self.motor_interface.read_param_float(motor_id, rid)
+        if not np.isclose(actual, value, rtol=1e-6):
+            raise RuntimeError(
+                f"motor {motor_id} on {self.motor_interface.name} rejected RID {rid} = {value}: reads {actual}"
+            )
 
     def set_control_mode(self, idx: int, control_mode: str) -> None:
         """Switch one motor at runtime; the control loop is paused while the register is written."""
