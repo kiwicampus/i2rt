@@ -68,7 +68,7 @@ def get_big_yam_robot(
         gripper_index=6,
         gripper_limits=gripper_type.get_gripper_limits(),
         gripper_type=gripper_type,
-        gripper_hold_torque=gripper_type.get_gripper_hold_torque(),
+        gripper_hold_force=gripper_type.get_gripper_hold_force(),
     )
     return get_robot()
 
@@ -81,7 +81,7 @@ def get_yam_robot(
     set_realtime_and_pin_callback: Optional[Callable[[int], None]] = None,
     gripper_max_vel: Optional[float] = None,  # strokes/s
     gripper_max_move_torque: Optional[float] = None,  # Nm
-    gripper_hold_torque: Optional[float] = None,  # Nm
+    gripper_hold_force: Optional[float] = None,  # N at the jaws
     gripper_kp_pos: Optional[float] = None,  # firmware KP_APR
 ) -> MotorChainRobot:
     """Gripper limits left at None take the gripper type's defaults; see MotorChainRobot."""
@@ -155,8 +155,8 @@ def get_yam_robot(
             gripper_index=6,
             gripper_limits=gripper_type.get_gripper_limits(),
             gripper_type=gripper_type,
-            gripper_hold_torque=(
-                gripper_type.get_gripper_hold_torque() if gripper_hold_torque is None else gripper_hold_torque
+            gripper_hold_force=(
+                gripper_type.get_gripper_hold_force() if gripper_hold_force is None else gripper_hold_force
             ),
             gripper_max_move_torque=gripper_max_move_torque,
             gripper_max_vel=gripper_max_vel,

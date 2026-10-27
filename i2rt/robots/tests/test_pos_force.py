@@ -18,7 +18,13 @@ from i2rt.motor_drivers.dm_driver import (
 from i2rt.motor_drivers.utils import ReceiveMode
 from i2rt.robots import motor_chain_robot, utils
 from i2rt.robots.motor_chain_robot import MotorChainRobot
-from i2rt.robots.utils import GripperClogDetector, GripperType, detect_gripper_limits
+from i2rt.robots.utils import (
+    GRIPPER_CLOG_FORCE,
+    GRIPPER_CLOG_RELEASE_FORCE,
+    GripperClogDetector,
+    GripperType,
+    detect_gripper_limits,
+)
 
 MOTOR_ID = 0x07
 RECV_ID = MOTOR_ID + 16
@@ -180,8 +186,9 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
     return fake
 
 
-def gripper_state(eff: float, vel: float = 0.0, current: float = 0.4, target: float = 0.0) -> dict:
+def gripper_state(eff: float, vel: float = 0.0, current: float = 0.4, target: float = 0.0, qpos: float = 3.0) -> dict:
     return {
+        "current_qpos": qpos,
         "current_qvel": vel,
         "current_eff": eff,
         "current_normalized_qpos": current,
@@ -201,11 +208,50 @@ def test_gripper_type_values() -> None:
         assert gripper_type.get_motor_kp_kd() == (3.0, 0.15)
         assert gripper_type.get_gripper_max_vel() == 4.5
         assert gripper_type.get_gripper_move_torque() == 1.5
-        assert gripper_type.get_gripper_hold_torque() == 0.5
+        assert gripper_type.get_gripper_hold_force() == 30.0
         detector = GripperClogDetector(gripper_type)
-        assert detector.clog_force_threshold == 0.3
-        assert detector.clog_release_threshold == 0.15
+        assert detector.clog_force_threshold == 20.0
+        assert detector.clog_release_threshold == 10.0
         assert detector.average_torque_window == 0.05
+
+
+# linear gripper: 0.096 m of jaw stroke over 6.57 rad of motor travel
+LINEAR_NM_PER_N = 0.096 / 6.57
+
+
+def test_linear_thresholds_match_effort_in_nm() -> None:
+    for effort in (0.29, 0.15):
+        force = GripperType.LINEAR_4310.effort_to_force(effort, current_angle=3.0)
+        assert force == pytest.approx(effort / LINEAR_NM_PER_N)
+    assert GRIPPER_CLOG_FORCE * LINEAR_NM_PER_N == pytest.approx(0.29, abs=0.005)
+    assert GRIPPER_CLOG_RELEASE_FORCE * LINEAR_NM_PER_N == pytest.approx(0.15, abs=0.005)
+
+
+def test_linear_hold_torque_is_position_independent() -> None:
+    expected = 0.3 + 30.0 * LINEAR_NM_PER_N
+    for gripper_type in (GripperType.LINEAR_4310, GripperType.LINEAR_3507):
+        for angle in (0.0, 3.0, 6.0):
+            assert gripper_type.force_to_torque(30.0, current_angle=angle) == pytest.approx(expected)
+    assert GripperType.LINEAR_4310.force_to_current_pu(30.0, current_angle=0.0) == pytest.approx(expected / 10.0)
+
+
+def crank_nm_per_n(raw: float) -> float:
+    radius = 0.071 / (2 * (np.cos(np.deg2rad(8)) - np.cos(np.deg2rad(170))))
+    return radius * np.sin(-raw + 0.174)
+
+
+def test_crank_hold_torque_follows_position() -> None:
+    torques = {raw: GripperType.CRANK_4310.force_to_torque(30.0, current_angle=raw) for raw in (0.0, -1.4, -2.7)}
+    for raw, torque in torques.items():
+        assert torque == pytest.approx(0.3 + 30.0 * crank_nm_per_n(raw))
+    # the crank needs the most torque mid stroke, where its lever arm is longest
+    assert torques[-1.4] > torques[0.0] and torques[-1.4] > torques[-2.7]
+
+
+def test_effort_to_force_inverts_the_frictionless_map() -> None:
+    for raw in (0.0, -1.4, -2.7):
+        force = GripperType.CRANK_4310.effort_to_force(0.5, current_angle=raw)
+        assert force == pytest.approx(0.5 / crank_nm_per_n(raw))
 
 
 def test_latches_above_threshold_when_slow(clock: FakeClock) -> None:
@@ -243,6 +289,14 @@ def test_releases_on_open_command(clock: FakeClock) -> None:
     detector = GripperClogDetector(GripperType.LINEAR_4310)
     assert feed(detector, clock, eff=0.35, duration=0.06)
     assert not feed(detector, clock, eff=0.35, duration=0.003, target=1.0)
+
+
+def test_crank_stays_clogged_at_hold_torque_near_closed(clock: FakeClock) -> None:
+    # near closed the 30 N hold needs little torque; the force thresholds keep it latched
+    detector = GripperClogDetector(GripperType.CRANK_4310)
+    hold = GripperType.CRANK_4310.force_to_torque(30.0, current_angle=-0.05)
+    assert feed(detector, clock, eff=0.6, duration=0.06, qpos=-0.05)
+    assert feed(detector, clock, eff=hold, duration=0.2, qpos=-0.05)
 
 
 def test_torque_to_current_uses_torque_max() -> None:
@@ -331,7 +385,11 @@ def no_server_thread() -> Iterator[None]:
 
 
 def make_robot(
-    chain: FakeChain, hold: float = 0.5, gripper_type: GripperType = GripperType.LINEAR_4310, **gripper: float
+    chain: FakeChain,
+    hold: float = 30.0,
+    gripper_type: GripperType = GripperType.LINEAR_4310,
+    limits: np.ndarray = LIMITS,
+    **gripper: float,
 ) -> MotorChainRobot:
     return MotorChainRobot(
         motor_chain=chain,
@@ -340,8 +398,8 @@ def make_robot(
         kp=[10.0, 3.0],
         kd=[1.0, 0.15],
         joint_limits=np.array([[-1.0, 1.0]]),
-        gripper_limits=LIMITS,
-        gripper_hold_torque=hold,
+        gripper_limits=limits,
+        gripper_hold_force=hold,
         gripper_type=gripper_type,
         **gripper,
     )
@@ -380,7 +438,7 @@ def test_robot_raises_when_mode_rejected(no_server_thread: None) -> None:
 def test_robot_clog_switches_current(no_server_thread: None, clock: FakeClock) -> None:
     chain = FakeChain()
     robot = make_robot(chain)
-    moving, holding = 0.15, 0.05
+    moving, holding = 0.15, (0.3 + 30.0 * LINEAR_NM_PER_N) / 10.0
 
     robot.command_joint_pos(np.array([0.0, 0.0]))
     run(robot, clock, 0.03)
@@ -413,3 +471,19 @@ def test_robot_without_force_limit_uses_full_current(no_server_thread: None, clo
     run(robot, clock, 0.06)
     chain.set_pos_force_limits.assert_called_once()
     assert chain.last_current() == 1.0
+
+
+def test_robot_crank_hold_current_follows_position(no_server_thread: None, clock: FakeClock) -> None:
+    chain = FakeChain()
+    chain.gripper_pos = -1.35
+    robot = make_robot(chain, gripper_type=GripperType.CRANK_4310, limits=np.array([0.0, -2.7]))
+    robot.command_joint_pos(np.array([0.0, 0.0]))
+    chain.gripper_eff = 0.6
+    run(robot, clock, 0.06)
+    assert chain.last_current() == pytest.approx(GripperType.CRANK_4310.force_to_current_pu(30.0, -1.35))
+
+    chain.gripper_pos = -0.1
+    # update() limits from the state it read on the previous cycle
+    run(robot, clock, 0.006)
+    assert chain.last_current() == pytest.approx(GripperType.CRANK_4310.force_to_current_pu(30.0, -0.1))
+    assert chain.last_current() < GripperType.CRANK_4310.force_to_current_pu(30.0, -1.35)
