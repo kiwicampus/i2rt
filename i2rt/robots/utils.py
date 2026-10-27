@@ -21,6 +21,9 @@ GRIPPER_FRICTION_TORQUE = 0.3  # Nm of transmission friction added on top of the
 # clog thresholds in jaw force (N); through the linear gripper map, about 0.29 and 0.15 Nm of effort
 GRIPPER_CLOG_FORCE = 20.0
 GRIPPER_CLOG_RELEASE_FORCE = 10.0
+# crank angles at the closed stop (raw motor 0) and at the open stop
+CRANK_CLOSE_ANGLE = np.deg2rad(10.0)
+CRANK_OPEN_ANGLE = np.deg2rad(170.0)
 
 
 class GripperType(enum.Enum):
@@ -155,9 +158,9 @@ class GripperType(enum.Enum):
                 0.2,
                 partial(
                     zero_linkage_crank_gripper_force_torque_map,
-                    motor_reading_to_crank_angle=lambda x: (-x + 0.174),
-                    gripper_close_angle=8 / 180.0 * np.pi,
-                    gripper_open_angle=170 / 180.0 * np.pi,
+                    motor_reading_to_crank_angle=lambda x: (-x + CRANK_CLOSE_ANGLE),
+                    gripper_close_angle=CRANK_CLOSE_ANGLE,
+                    gripper_open_angle=CRANK_OPEN_ANGLE,
                     gripper_stroke=0.071,  # unit in meter
                 ),
             )
@@ -259,22 +262,19 @@ def zero_linkage_crank_gripper_force_torque_map(
     Args:
         gripper_close_angle (float): Angle of the crank in radians at the closed position.
         gripper_open_angle (float): Angle of the crank in radians at the open position.
-        gripper_stroke (float): Linear displacement of the gripper in meters.
-        current_angle (float): Current crank angle in radians (relative to the closed position).
+        gripper_stroke (float): Jaw opening between the closed and open stops in meters; both jaws move.
+        current_angle (float): Raw motor angle in radians, converted by motor_reading_to_crank_angle.
         gripper_force (float): Required gripping force in Newtons (N).
 
     Returns:
         float: Required motor torque in Newton-meters (Nm).
     """
     current_angle = motor_reading_to_crank_angle(current_angle)
-    # Compute crank radius based on the total stroke and angle change
+    # each jaw travels crank_radius * (cos(close) - cos(angle)), so the opening is twice that
     crank_radius = gripper_stroke / (2 * (np.cos(gripper_close_angle) - np.cos(gripper_open_angle)))
-    # gripper_position = crank_radius * (np.cos(gripper_close_angle) - np.cos(current_angle))
-    grad_gripper_position = crank_radius * np.sin(current_angle)
-
-    # Compute the required torque
-    target_torque = gripper_force * grad_gripper_position
-    return target_torque
+    grad_jaw_opening = 2 * crank_radius * np.sin(current_angle)
+    # virtual work: the squeeze force acts over the change in jaw opening
+    return gripper_force * grad_jaw_opening
 
 
 class LockFreeCircularBuffer:

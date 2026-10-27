@@ -236,8 +236,17 @@ def test_linear_hold_torque_is_position_independent() -> None:
 
 
 def crank_nm_per_n(raw: float) -> float:
-    radius = 0.071 / (2 * (np.cos(np.deg2rad(8)) - np.cos(np.deg2rad(170))))
-    return radius * np.sin(-raw + 0.174)
+    # derivative of the jaw opening, 0.071 * (cos 10 - cos theta) / (cos 10 - cos 170)
+    angle = -raw + np.deg2rad(10)
+    return 0.071 * np.sin(angle) / (np.cos(np.deg2rad(10)) - np.cos(np.deg2rad(170)))
+
+
+def test_crank_map_integrates_to_the_stroke() -> None:
+    # integrating the torque per newton from the closed to the open stop gives the full jaw opening
+    raws = np.linspace(0.0, -np.deg2rad(160), 4001)
+    per_newton = [GripperType.CRANK_4310.force_to_torque(1.0, current_angle=r) - 0.3 for r in raws]
+    assert np.trapz(per_newton, -raws) == pytest.approx(0.071, rel=1e-4)
+    assert GripperType.CRANK_4310.force_to_torque(1.0, current_angle=0.0) - 0.3 == pytest.approx(crank_nm_per_n(0.0))
 
 
 def test_crank_hold_torque_follows_position() -> None:
@@ -478,7 +487,8 @@ def test_robot_crank_hold_current_follows_position(no_server_thread: None, clock
     chain.gripper_pos = -1.35
     robot = make_robot(chain, gripper_type=GripperType.CRANK_4310, limits=np.array([0.0, -2.7]))
     robot.command_joint_pos(np.array([0.0, 0.0]))
-    chain.gripper_eff = 0.6
+    # mid stroke the clog threshold is 0.72 Nm of effort
+    chain.gripper_eff = 0.9
     run(robot, clock, 0.06)
     assert chain.last_current() == pytest.approx(GripperType.CRANK_4310.force_to_current_pu(30.0, -1.35))
 
