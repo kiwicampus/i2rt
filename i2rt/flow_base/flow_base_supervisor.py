@@ -100,18 +100,14 @@ def build_controller_command(
         venv: Path to the virtualenv whose bin/activate is sourced.
         root: Repository root placed on PYTHONPATH and used to locate the script.
         channel: CAN channel passed to the controller (e.g. "can0").
-        no_linear_rail: When True, append --no-linear-rail (base-only).
+        no_linear_rail: When True, launch base only; otherwise pass --linear-rail.
 
     Returns:
         A command list suitable for subprocess.Popen (a single bash -lc invocation).
     """
     script = f"{root}/i2rt/flow_base/flow_base_controller.py"
-    inner = (
-        f"source {venv}/bin/activate && "
-        f"PYTHONPATH={root} python {script} --channel {channel}"
-    )
-    if no_linear_rail:
-        inner += " --no-linear-rail"
+    inner = f"source {venv}/bin/activate && PYTHONPATH={root} python {script} --channel {channel}"
+    inner += " --no-linear-rail" if no_linear_rail else " --linear-rail"
     return ["bash", "-lc", inner]
 
 
@@ -267,29 +263,33 @@ def _run_self_test(host: str, port: int, command: str) -> None:
 def main() -> None:
     """Run the supervisor RPC server, or a one-shot self-test client."""
     parser = argparse.ArgumentParser(description="FlowBase controller supervisor daemon")
-    parser.add_argument("--venv", type=str, default=_DEFAULT_VENV,
-                        help="Virtualenv whose bin/activate is sourced for the controller")
-    parser.add_argument("--root", type=str, default=_DEFAULT_ROOT,
-                        help="Repo root on PYTHONPATH; locates flow_base_controller.py")
-    parser.add_argument("--channel", type=str, default=_DEFAULT_CHANNEL,
-                        help="CAN channel passed to the controller")
-    parser.add_argument("--no-linear-rail", action="store_true",
-                        help="Launch the controller with --no-linear-rail (base only)")
-    parser.add_argument("--port", type=int, default=SUPERVISOR_DEFAULT_PORT,
-                        help="Supervisor RPC port")
-    parser.add_argument("--host", type=str, default="localhost",
-                        help="Host to reach the supervisor (self-test mode only)")
-    parser.add_argument("--self-test", choices=["start", "stop", "status"], default=None,
-                        help="Act as a client against a running supervisor and exit")
+    parser.add_argument(
+        "--venv", type=str, default=_DEFAULT_VENV, help="Virtualenv whose bin/activate is sourced for the controller"
+    )
+    parser.add_argument(
+        "--root", type=str, default=_DEFAULT_ROOT, help="Repo root on PYTHONPATH; locates flow_base_controller.py"
+    )
+    parser.add_argument("--channel", type=str, default=_DEFAULT_CHANNEL, help="CAN channel passed to the controller")
+    parser.add_argument(
+        "--no-linear-rail", action="store_true", help="Launch the controller with --no-linear-rail (base only)"
+    )
+    parser.add_argument("--port", type=int, default=SUPERVISOR_DEFAULT_PORT, help="Supervisor RPC port")
+    parser.add_argument(
+        "--host", type=str, default="localhost", help="Host to reach the supervisor (self-test mode only)"
+    )
+    parser.add_argument(
+        "--self-test",
+        choices=["start", "stop", "status"],
+        default=None,
+        help="Act as a client against a running supervisor and exit",
+    )
     args = parser.parse_args()
 
     if args.self_test is not None:
         _run_self_test(args.host, args.port, args.self_test)
         return
 
-    command = build_controller_command(
-        args.venv, args.root, args.channel, no_linear_rail=args.no_linear_rail
-    )
+    command = build_controller_command(args.venv, args.root, args.channel, no_linear_rail=args.no_linear_rail)
     controller = ControllerProcess(command)
     atexit.register(controller.stop_if_owned)
 

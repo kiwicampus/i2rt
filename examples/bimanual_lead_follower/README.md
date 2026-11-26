@@ -18,7 +18,7 @@ This tutorial demonstrates how to set up a bimanual lead-follower system. This t
 
 **⚠️ Critical Step:** Plug in **one CAN device at a time** to avoid conflicts.
 
-1. Follow the instructions in [set_persist_id_socket_can.md](../../doc/set_persist_id_socket_can.md) to configure each arm:
+1. Follow the instructions in [set-persistent-can-ids.md](../../docs/guides/set-persistent-can-ids.md) to configure each arm:
    - **Left leader arm:** `can_leader_l`
    - **Right leader arm:** `can_leader_r`
    - **Left follower arm:** `can_follower_l`
@@ -55,6 +55,8 @@ Assume you've installed the python virtual environment and run `source .venv/bin
 
 ```bash
 python bimanual_lead_follower.py
+# leaders fitted with the short (v2) teaching handle:
+python bimanual_lead_follower.py --leader-gripper yam_teaching_handle_v2
 ```
 
 ## Operation

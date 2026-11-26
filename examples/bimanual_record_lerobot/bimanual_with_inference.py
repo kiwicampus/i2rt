@@ -63,7 +63,7 @@ def check_all_can_interfaces():
 def launch_gello_process(can_channel, gripper, server_port):
     """Launch a single follower gello process"""
     python_path = "python"
-    script_path = os.path.join(current_file_path, "..", "..", "scripts", "minimum_gello.py")
+    script_path = os.path.join(current_file_path, "..", "minimum_gello", "minimum_gello.py")
     
     cmd = [python_path, os.path.expanduser(script_path),
            "--can_channel", can_channel,
